@@ -1,11 +1,34 @@
 import numpy as np
 import pandas as pd
 
-# Load the first spreadsheet
-article_titles_with_stocks = pd.read_csv('../RawDataSets/analyst_ratings_processed.csv', skiprows=[1])
-article_titles_with_stocks = article_titles_with_stocks.dropna()
-article_titles_with_stocks = article_titles_with_stocks.drop(article_titles_with_stocks.columns[0], axis=1)
+from io import BytesIO
 
+# Load the first spreadsheet
+dfs = {}
+zip_files = 'zip_files'
+
+for zip_file_name in os.listdir(zip_files):
+    if zip_file_name.endswith('.zip'):
+        zip_file_path = os.path.join(zip_files, zip_file_name)
+        # open the zip file
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_file:
+            # iterate through each file in zip folder
+            for csv_file_name in zip_file.namelist():
+                # check for csv files
+                if csv_file_name.endswith('.csv'):
+                    # read csv from zip folder into df
+                    with zip_file.open(csv_file_name) as csv_file:
+                        df_name = csv_file_name[:-4]
+                        dfs[df_name] = pd.read_csv(BytesIO(csv_file.read()))
+# merge analyst dfs into one
+dfs['analyst_ratings_processed'] = pd.concat([dfs['analyst_ratings_processed_1'], dfs['analyst_ratings_processed_2']], ignore_index=True)
+dfs['analyst_ratings_processed'] = dfs['analyst_ratings_processed'].drop(dfs['analyst_ratings_processed'].columns[0], axis=1)
+dfs['analyst_ratings_processed'] = dfs['analyst_ratings_processed'].dropna()
+# delete smaller dfs as they were merged into one
+del dfs['analyst_ratings_processed_1']
+del dfs['analyst_ratings_processed_2']
+
+article_titles_with_stocks = dfs['analyst_ratings_processed']
 # Convert 'title' column to string
 article_titles_with_stocks['title'] = article_titles_with_stocks['title'].astype('string')
 
@@ -17,7 +40,7 @@ article_titles_with_stocks['date'] = pd.to_datetime(article_titles_with_stocks['
 article_titles_with_stocks['stock'] = article_titles_with_stocks['stock'].astype('string')
 
 # Load the second spreadsheet
-stock_price_lookup = pd.read_csv('../RawDataSets/SnP500-All-assets.csv', index_col=0, skiprows=[0, 2])
+stock_price_lookup = dfs['sp500_all_assets']
 
 stock_price_lookup.index = pd.to_datetime(stock_price_lookup.index)
 
@@ -40,4 +63,4 @@ for index, row in article_titles_with_stocks.iterrows():
 
 article_titles_with_stocks = article_titles_with_stocks.dropna()
 print("Writing to csv file in CleanedDataSets directory")
-article_titles_with_stocks.to_csv('../CleanedDataSets/cleaned_dataset.csv', header=True, index=False)
+article_titles_with_stocks.to_csv('cleaned_dataset.csv', header=True, index=False)
