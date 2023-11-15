@@ -1,10 +1,15 @@
 import zipfile
 import numpy as np
 import pandas as pd
+import pandasql as ps
 import os
 
 from datetime import datetime
 from io import BytesIO
+
+import warnings
+from pandas.core.common import SettingWithCopyWarning
+warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
 
 # Load the first spreadsheet
 cleaned_dataset = 'cleaned_dataset.csv'
@@ -48,24 +53,64 @@ if not os.path.exists(cleaned_dataset):
 
     # Load the second spreadsheet
     stock_price_lookup = dfs['sp500_all_assets']
-    stock_price_lookup.index = pd.to_datetime(stock_price_lookup['Date'])
+    # stock_price_lookup.index = pd.to_datetime(stock_price_lookup['Date'])
 
-    # Add new column to get stock price info in articles df
-    article_titles_with_stocks['closing-price'] = np.NAN
+    stock_price_lookup['Date'] = pd.to_datetime(stock_price_lookup['Date'])
 
-    for index, row in article_titles_with_stocks.iterrows():
-        date_lookup = str(article_titles_with_stocks.at[index, 'date']).split(' ')[0]
-        stock_lookup = article_titles_with_stocks.at[index, 'stock']
-        try:
-            article_titles_with_stocks.at[index, 'closing-price'] = \
-                stock_price_lookup.loc[date_lookup, stock_lookup].round(2)
-        except KeyError:
-            # already created column as np.NaN, dont need to reassign if no data
-            pass
+    # original data has companies' tickers as each column,
+    # convert the data into a dataframe with columns of date, ticker, prices
+    df_list = []
+    for col in stock_price_lookup.columns:
+        if col != 'Date':
+            df_temp = stock_price_lookup[['Date', col]]
+            df_temp['Ticker'] = col
+            df_temp = df_temp.rename(columns={col:"Price"})
+            df_temp = df_temp.reset_index(drop=True)
+            df_list.append(df_temp)
+    stock_price_converted = pd.concat(df_list, axis=0)
 
-    article_titles_with_stocks = article_titles_with_stocks.dropna()
+    # to calculate daily return, get the price from previous day
+    stock_price_converted = stock_price_converted.sort_values(by=['Ticker', 'Date'])
+    stock_price_converted['prev_price'] = stock_price_converted.groupby(['Ticker'])['Price'].shift(1)
+    # drop rows without price info
+    stock_price_converted = stock_price_converted[(stock_price_converted['Price'] != 0) & (stock_price_converted['prev_price'] != 0)]
+    stock_return = stock_price_converted.dropna()
+    stock_return['return'] = stock_return.apply(lambda x: (x['Price'] - x['prev_price'])/x['prev_price'], axis=1)
+    # previous-day return
+    stock_return['ret_previous'] = stock_return.groupby(['Ticker'])['return'].shift(1)
+    # after-day return
+    stock_return['ret_after'] = stock_return.groupby(['Ticker'])['return'].shift(-1)
+
+    # return calculations (p: previous, a: after)
+    # ret_p1_a1: average return of the 3-day window t=-1 to t=1 (t=0 is the event day)
+    # ret_p3_p1: average return of the 3-day window t=-3 to t=-1
+    # ret_a1_a3: average return of the 3-day window t=1 to t=3
+    stock_return['ret_p1_a1'] = stock_return.groupby('Ticker')['return'].transform(lambda x: x.rolling(window=3, min_periods=3, center=True).mean())
+    stock_return['ret_p3_p1'] = stock_return.groupby(['Ticker'])['ret_p1_a1'].shift(2)
+    stock_return['ret_a1_a3'] = stock_return.groupby(['Ticker'])['ret_p1_a1'].shift(-2)
+    # ret_p2_a2: average return of the 5-day window t=-2 to t=2 (t=0 is the event day)
+    # ret_p5_p1: average return of the 5-day window t=-5 to t=-1
+    # ret_a1_a5: average return of the 5-day window t=1 to t=5
+    stock_return['ret_p2_a2'] = stock_return.groupby('Ticker')['return'].transform(lambda x: x.rolling(window=5, min_periods=5, center=True).mean())
+    stock_return['ret_p5_p1'] = stock_return.groupby(['Ticker'])['ret_p2_a2'].shift(3)
+    stock_return['ret_a1_a5'] = stock_return.groupby(['Ticker'])['ret_p2_a2'].shift(-3)
+
+    # drop na
+    stock_return = stock_return.dropna()
+
+    query = """
+        SELECT *
+        FROM article_titles_with_stocks AS news
+        LEFT JOIN stock_return AS ret
+        ON news.date = ret.Date AND news.stock = ret.Ticker
+        ORDER BY Ticker, Date
+    """
+    merged_df = ps.sqldf(query, locals())
+    merged_df = merged_df.drop(columns=['date', 'Ticker'])
+    merged_df = merged_df.dropna()
+    print(f"Number of observation in the final dataset: {merged_df.shape[0]}")
     print("Writing to csv file in CleanedDataSets directory")
-    article_titles_with_stocks.to_csv('cleaned_dataset.csv', header=True, index=False)
+    merged_df.to_csv('cleaned_dataset.csv', header=True, index=False)
     print('end ', datetime.now())
 else:
     print("Cleaned df already exists")
