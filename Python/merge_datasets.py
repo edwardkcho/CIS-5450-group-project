@@ -12,12 +12,12 @@ from pandas.core.common import SettingWithCopyWarning
 warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
 
 # Load the first spreadsheet
-cleaned_dataset = 'cleaned_dataset.csv'
+cleaned_dataset = '../cleaned_dataset.csv'
 if not os.path.exists(cleaned_dataset):
     print('Creating cleaned df...')
     print('start ', datetime.now())
     dfs = {}
-    zip_files = 'zip_files'
+    zip_files = '../zip_files'
 
     for zip_file_name in os.listdir(zip_files):
         if zip_file_name.endswith('.zip'):
