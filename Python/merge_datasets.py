@@ -3,7 +3,7 @@ from io import TextIOWrapper
 import os
 import tempfile
 from pyspark.sql import SparkSession, Window
-from pyspark.sql.functions import col, expr, lag, lit
+from pyspark.sql.functions import col, expr, lag, lit, when
 from pyspark.sql.types import StructType, StructField, StringType, DateType
 
 from datetime import datetime
@@ -80,13 +80,17 @@ if not os.path.exists(cleaned_dataset):
                                                         stock_price_lookup.columns if col_name != "Date"])
 
     # Add a new column for Ticker
-    for col_name in stock_price_lookup.columns:
-        if col_name != "Date":
-            stock_price_converted = stock_price_converted.withColumn("Ticker", lit(col_name))
+    stock_price_converted = stock_price_converted.withColumn(
+        "Ticker",
+        when(
+            col("Date") != "Date",  # Replace "Date" with the actual value representing the date column
+            lit(col("Date"))
+        )
+    )
 
     # Calculate daily return
     windowSpec = Window().partitionBy("Ticker").orderBy("Date")
-    stock_price_converted = stock_price_converted.withColumn("prev_price", lag("Price").over(windowSpec))
+    stock_price_converted = stock_price_converted.withColumn("prev_price", lag(col("Price")).over(windowSpec))
     stock_price_converted = stock_price_converted.filter((col("Price") != 0) & (col("prev_price") != 0))
     stock_return = stock_price_converted.dropna().withColumn("return", (col("Price") - col("prev_price")) / col("prev_price"))
 
