@@ -1,118 +1,128 @@
 import zipfile
-import numpy as np
-import pandas as pd
-import pandasql as ps
+from io import TextIOWrapper
 import os
+import tempfile
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import col, expr, lag, lit
+from pyspark.sql.types import StructType, StructField, StringType, DateType
 
 from datetime import datetime
-from io import BytesIO
 
 import warnings
-from pandas.core.common import SettingWithCopyWarning
+from pandas.errors import SettingWithCopyWarning
 warnings.simplefilter(action="ignore", category=SettingWithCopyWarning)
 
+# Create a Spark session
+spark = SparkSession.builder.appName("StockAnalysis").getOrCreate()
+
 # Load the first spreadsheet
-cleaned_dataset = 'cleaned_dataset.csv'
+cleaned_dataset = '../updated_cleaned_dataset.csv'
+
 if not os.path.exists(cleaned_dataset):
     print('Creating cleaned df...')
     print('start ', datetime.now())
     dfs = {}
-    zip_files = 'zip_files'
+    zip_files = '../zip_files'
+
+    # Schema for article_titles_with_stocks DataFrame
+    article_titles_with_stocks_schema = StructType([
+        StructField("title", StringType(), True),
+        StructField("date", DateType(), True),
+        StructField("stock", StringType(), True)
+    ])
+
+    # Create an empty DataFrame with the specified schema
+    article_titles_with_stocks = spark.createDataFrame([], schema=article_titles_with_stocks_schema)
 
     for zip_file_name in os.listdir(zip_files):
         if zip_file_name.endswith('.zip'):
             zip_file_path = os.path.join(zip_files, zip_file_name)
-            # open the zip file
+
+            # Read CSV files directly into Spark DataFrame
             with zipfile.ZipFile(zip_file_path, 'r') as zip_file:
-                # iterate through each file in zip folder
                 for csv_file_name in zip_file.namelist():
-                    # check for csv files
                     if csv_file_name.endswith('.csv'):
-                        # read csv from zip folder into df
+                        df_name = csv_file_name[:-4]
+
+                        # Read CSV content from BytesIO
                         with zip_file.open(csv_file_name) as csv_file:
-                            df_name = csv_file_name[:-4]
-                            dfs[df_name] = pd.read_csv(BytesIO(csv_file.read()))
-    # merge analyst dfs into one
-    dfs['analyst_ratings_processed'] = pd.concat([dfs['analyst_ratings_processed_1'], dfs['analyst_ratings_processed_2']], ignore_index=True)
-    dfs['analyst_ratings_processed'] = dfs['analyst_ratings_processed'].drop(dfs['analyst_ratings_processed'].columns[0], axis=1)
-    dfs['analyst_ratings_processed'] = dfs['analyst_ratings_processed'].dropna()
-    # delete smaller dfs as they were merged into one
-    del dfs['analyst_ratings_processed_1']
-    del dfs['analyst_ratings_processed_2']
+                            text_io_wrapper = TextIOWrapper(csv_file, encoding='utf-8')
+                            csv_content = text_io_wrapper.read()
 
-    article_titles_with_stocks = dfs['analyst_ratings_processed']
-    # Convert 'title' column to string
-    article_titles_with_stocks['title'] = article_titles_with_stocks['title'].astype('string')
+                        # Save the CSV content to a temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, mode='w', encoding='utf-8') as temp_csv:
+                            temp_csv.write(csv_content)
+                            temp_csv_path = temp_csv.name
 
-    # Convert 'date' column to datetime format
-    article_titles_with_stocks['date'] = article_titles_with_stocks['date'].apply(lambda x: x.split(' ')[0])
-    article_titles_with_stocks['date'] = pd.to_datetime(article_titles_with_stocks['date'])
+                        # Create DataFrame from the temporary file
+                        df = spark.read.csv(temp_csv_path, header=True, inferSchema=True)
 
-    # Convert 'stock' column to string
-    article_titles_with_stocks['stock'] = article_titles_with_stocks['stock'].astype('string')
+                        # Clean up the temporary file
+                        os.remove(temp_csv_path)
+
+                        dfs[df_name] = df
+
+    # Merge analyst dfs into one
+    analyst_ratings_processed = dfs['analyst_ratings_processed_1'].union(dfs['analyst_ratings_processed_2'])
+    analyst_ratings_processed = analyst_ratings_processed.drop(dfs['analyst_ratings_processed_1'].columns[0])
+
+    # Convert columns to appropriate types
+    article_titles_with_stocks = article_titles_with_stocks.withColumn("title", col("title").cast("string"))
+    article_titles_with_stocks = article_titles_with_stocks.withColumn("date", expr("CAST(SUBSTRING_INDEX(date, ' ', 1) AS DATE)"))
+    article_titles_with_stocks = article_titles_with_stocks.withColumn("stock", col("stock").cast("string"))
 
     # Load the second spreadsheet
     stock_price_lookup = dfs['sp500_all_assets']
-    # stock_price_lookup.index = pd.to_datetime(stock_price_lookup['Date'])
 
-    stock_price_lookup['Date'] = pd.to_datetime(stock_price_lookup['Date'])
+    # Convert the data into a dataframe with columns of date, ticker, prices
+    stock_price_converted = stock_price_lookup.select("Date",
+                                                      *[col(col_name).cast("double").alias("Price") for col_name in
+                                                        stock_price_lookup.columns if col_name != "Date"])
 
-    # original data has companies' tickers as each column,
-    # convert the data into a dataframe with columns of date, ticker, prices
-    df_list = []
-    for col in stock_price_lookup.columns:
-        if col != 'Date':
-            df_temp = stock_price_lookup[['Date', col]]
-            df_temp['Ticker'] = col
-            df_temp = df_temp.rename(columns={col:"Price"})
-            df_temp = df_temp.reset_index(drop=True)
-            df_list.append(df_temp)
-    stock_price_converted = pd.concat(df_list, axis=0)
+    # Add a new column for Ticker
+    for col_name in stock_price_lookup.columns:
+        if col_name != "Date":
+            stock_price_converted = stock_price_converted.withColumn("Ticker", lit(col_name))
 
-    # to calculate daily return, get the price from previous day
-    stock_price_converted = stock_price_converted.sort_values(by=['Ticker', 'Date'])
-    stock_price_converted['prev_price'] = stock_price_converted.groupby(['Ticker'])['Price'].shift(1)
-    # drop rows without price info
-    stock_price_converted = stock_price_converted[(stock_price_converted['Price'] != 0) & (stock_price_converted['prev_price'] != 0)]
-    stock_return = stock_price_converted.dropna()
-    stock_return['return'] = stock_return.apply(lambda x: (x['Price'] - x['prev_price'])/x['prev_price'], axis=1)
-    # previous-day return
-    stock_return['ret_previous'] = stock_return.groupby(['Ticker'])['return'].shift(1)
-    # after-day return
-    stock_return['ret_after'] = stock_return.groupby(['Ticker'])['return'].shift(-1)
+    # Calculate daily return
+    windowSpec = Window().partitionBy("Ticker").orderBy("Date")
+    stock_price_converted = stock_price_converted.withColumn("prev_price", lag("Price").over(windowSpec))
+    stock_price_converted = stock_price_converted.filter((col("Price") != 0) & (col("prev_price") != 0))
+    stock_return = stock_price_converted.dropna().withColumn("return", (col("Price") - col("prev_price")) / col("prev_price"))
 
-    # return calculations (p: previous, a: after)
-    # ret_p1_a1: average return of the 3-day window t=-1 to t=1 (t=0 is the event day)
-    # ret_p3_p1: average return of the 3-day window t=-3 to t=-1
-    # ret_a1_a3: average return of the 3-day window t=1 to t=3
-    stock_return['ret_p1_a1'] = stock_return.groupby('Ticker')['return'].transform(lambda x: x.rolling(window=3, min_periods=3, center=True).mean())
-    stock_return['ret_p3_p1'] = stock_return.groupby(['Ticker'])['ret_p1_a1'].shift(2)
-    stock_return['ret_a1_a3'] = stock_return.groupby(['Ticker'])['ret_p1_a1'].shift(-2)
-    # ret_p2_a2: average return of the 5-day window t=-2 to t=2 (t=0 is the event day)
-    # ret_p5_p1: average return of the 5-day window t=-5 to t=-1
-    # ret_a1_a5: average return of the 5-day window t=1 to t=5
-    stock_return['ret_p2_a2'] = stock_return.groupby('Ticker')['return'].transform(lambda x: x.rolling(window=5, min_periods=5, center=True).mean())
-    stock_return['ret_p5_p1'] = stock_return.groupby(['Ticker'])['ret_p2_a2'].shift(3)
-    stock_return['ret_a1_a5'] = stock_return.groupby(['Ticker'])['ret_p2_a2'].shift(-3)
+    # Calculate previous-day and after-day returns
+    stock_return = stock_return.withColumn("ret_previous", lag("return").over(windowSpec))
+    stock_return = stock_return.withColumn("ret_after", lag("return", -1).over(windowSpec))
 
-    # drop na
-    stock_return = stock_return.dropna()
+    # Return calculations
+    stock_return = stock_return.drop("Price", "prev_price")
+    stock_return = stock_return.withColumn("ret_p1_a1", expr("AVG(return) OVER (PARTITION BY Ticker ORDER BY Date ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"))
+    stock_return = stock_return.withColumn("ret_p3_p1", lag("ret_p1_a1", 2).over(windowSpec))
+    stock_return = stock_return.withColumn("ret_a1_a3", lag("ret_p1_a1", -2).over(windowSpec))
+    stock_return = stock_return.withColumn("ret_p2_a2", expr("AVG(return) OVER (PARTITION BY Ticker ORDER BY Date ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)"))
+    stock_return = stock_return.withColumn("ret_p5_p1", lag("ret_p2_a2", 3).over(windowSpec))
+    stock_return = stock_return.withColumn("ret_a1_a5", lag("ret_p2_a2", -3).over(windowSpec))
 
-    query = """
-        SELECT *
-        FROM article_titles_with_stocks AS news
-        LEFT JOIN stock_return AS ret
-        ON news.date = ret.Date AND news.stock = ret.Ticker
-        ORDER BY Ticker, Date
-    """
-    merged_df = ps.sqldf(query, locals())
-    merged_df = merged_df.drop(columns=['date', 'Ticker'])
-    merged_df = merged_df.dropna()
-    print(f"Number of observation in the final dataset: {merged_df.shape[0]}")
+    # Drop unnecessary columns
+    stock_return = stock_return.drop("Price", "prev_price")
+
+    # SQL Join to merge DataFrames
+    merged_df = article_titles_with_stocks.join(
+        stock_return,
+        (col("date") == col("Date")) & (col("stock") == col("Ticker")),
+        "left_outer"
+    ).orderBy("Ticker", "Date")
+
+    merged_df = merged_df.drop("date", "Ticker").na.drop()
+
+    print(f"Number of observations in the final dataset: {merged_df.count()}")
     print("Writing to csv file in CleanedDataSets directory")
-    merged_df.to_csv('cleaned_dataset.csv', header=True, index=False)
+    merged_df.write.csv('updated_cleaned_dataset.csv', header=True, mode='overwrite')
     print('end ', datetime.now())
+
 else:
     print("Cleaned df already exists")
-    article_titles_with_stocks = pd.read_csv(cleaned_dataset, index_col='date')
-# print(article_titles_with_stocks.head())
+    article_titles_with_stocks = spark.read.csv(cleaned_dataset, header=True)
+
+# Show the first few rows of the resulting DataFrame
+article_titles_with_stocks.show()
